@@ -1,6 +1,7 @@
 #include <iostream>
 #include <fstream>
 #include <vector>
+#include <cmath>
 
 #include <SDL.h>
 #include <glad/glad.h>
@@ -9,35 +10,79 @@
 #include "matrix.h"
 #include "affine2d.h"
 #include "fftseq.h"
+#include "cmap.h"
 
-void test_fft_seq()
+static const std::size_t WIN_HEIGHT = 800;
+static const std::size_t WIN_WIDTH = 1280;
+static const std::size_t FFT_SIZE = 2048;
+static const float SPECTRUM_HEIGHT = 0.2f;
+static const std::string cmap_path = "res/cmap/turbo.csv";
+
+void GLAPIENTRY
+message_callback(GLenum source, GLenum type, GLuint id, GLenum severity,
+        GLsizei length, const GLchar* msg, const void* user)
 {
-    std::ifstream f("/tmp/mpd.fifo");
-    if (f.good()) {
-        std::cout << "Opened successfully." << std::endl;
-    }
-    PcmStream<int16_t> stream(f);
-    stream.channels(2);
-    stream.solo(0);
-
-    std::vector<std::complex<float>> v;
-    while ((v = stream.read_chunk(256)).empty()) {}
-    for (auto x : v) {
-        std::cout << x << std::endl;
-    }
+    std::cerr << "type = " << type << ", severity = " << severity << ", msg = " << msg << std::endl;
 }
 
-void test_no_block_adapter()
+std::vector<float> fft_db(const std::vector<float>& fft)
 {
-    std::ifstream f("example.txt");
-    NoBlockAdapter nba(f);
-    for (int i = 0; i < 12; i++) {
-        while (!nba.read(256)) {}
-        while (!nba.done()) {}
+    std::vector<float> out(fft.size());
 
-        std::string msg(nba.result(), 256);
-        std::cout << msg << std::endl;
+    for (std::size_t i = 0; i < fft.size(); i++) {
+        out[i] = 20.0f * std::log10(fft[i]);
     }
+
+    return out;
+}
+
+std::vector<float> fft_pos_abs(const std::vector<std::complex<float>>& fft)
+{
+    std::vector<float> out(fft.size() / 2);
+    float norm = 2.0f / fft.size();
+    for (std::size_t i = 0; i < out.size(); i++) {
+        out[i] = std::abs(fft[i]) * norm;
+    }
+
+    return out;
+}
+
+std::vector<float> fft_shift_abs(const std::vector<std::complex<float>>& fft)
+{
+    std::vector<float> out(fft.size());
+    std::size_t half = out.size() / 2;
+    float norm = 1.0f / fft.size();
+    for (std::size_t i = 0; i < out.size(); i++) {
+        int shift = (i < half) ? half : -half;
+        out[i] = std::abs(fft[i + shift]) * norm;
+    }
+
+    return out;
+}
+
+void gen_fft_mipmap(const std::vector<std::complex<float>>& fft,
+        std::size_t idx, bool negative = false)
+{
+    std::vector<float> mipmap;
+    if (negative) {
+        mipmap = fft_shift_abs(fft);
+    } else {
+        mipmap = fft_pos_abs(fft);
+    }
+
+    int level = 0;
+    do {
+        std::vector<float> tex_line = fft_db(mipmap);
+        glTexSubImage2D(GL_TEXTURE_1D_ARRAY, level, 0, idx, tex_line.size(), 1,
+                GL_RED, GL_FLOAT, tex_line.data());
+
+        for (std::size_t i = 0; i < mipmap.size() / 2; ++i) {
+            mipmap[i] = 0.5f * (mipmap[2 * i] + mipmap[2 * i + 1]);
+        }
+        mipmap.resize(mipmap.size() / 2);
+        level++;
+
+    } while (mipmap.size() > 1);
 }
 
 int main()
@@ -54,8 +99,8 @@ int main()
             "wfall",
             SDL_WINDOWPOS_UNDEFINED,
             SDL_WINDOWPOS_UNDEFINED,
-            1280,
-            720,
+            WIN_WIDTH,
+            WIN_HEIGHT,
             SDL_WINDOW_OPENGL
     );
 
@@ -80,6 +125,9 @@ int main()
 
     std::cout << "OpenGL loaded successfully version " << glGetString(GL_VERSION) << std::endl;
     std::cout << "OpenGL loaded on renderer " << glGetString(GL_RENDERER) << std::endl;
+
+    glEnable(GL_DEBUG_OUTPUT);
+    glDebugMessageCallback(message_callback, nullptr);
 
     Shader spectrum_shader = Shader::compile("res/shader/shader.vert", "res/shader/spectrum.frag");
     if (spectrum_shader.bad()) {
@@ -119,19 +167,73 @@ int main()
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*) (2 * sizeof(float)));
     glEnableVertexAttribArray(1);
 
+    glActiveTexture(GL_TEXTURE0);
+
+    GLuint texture;
+    glGenTextures(1, &texture);
+
+    glBindTexture(GL_TEXTURE_1D_ARRAY, texture);
+
+    glTexParameteri(GL_TEXTURE_1D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_1D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    glTexParameteri(GL_TEXTURE_1D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+    float border_color[4] = {-200.f, 0.0f, 0.0f, 0.0f};
+    glTexParameterfv(GL_TEXTURE_1D_ARRAY, GL_TEXTURE_BORDER_COLOR, border_color);
+
+    std::vector<float> wfall_init(FFT_SIZE * 1024, -250.0f);
+    glTexImage2D(GL_TEXTURE_1D_ARRAY, 0, GL_R32F, FFT_SIZE, 1024, 0, GL_RED, GL_FLOAT, wfall_init.data());
+    glGenerateMipmap(GL_TEXTURE_1D_ARRAY);
+
+    glActiveTexture(GL_TEXTURE0 + 1);
+
+    GLuint cmap_texture;
+    glGenTextures(1, &cmap_texture);
+
+    glBindTexture(GL_TEXTURE_1D, cmap_texture);
+
+    glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+
+    auto cmap_data = csv_read_cmap(cmap_path);
+    std::cout << "Loaded " << cmap_path << " read " << cmap_data.size() << " colors" << std::endl;
+    glTexImage1D(GL_TEXTURE_1D, 0, GL_RGB32F, cmap_data.size(), 0,
+            GL_RGB, GL_FLOAT, cmap_data.data());
+
+    glActiveTexture(GL_TEXTURE0);
+
+    std::size_t line = 0;
+
+    PcmStream<int16_t> stream(std::cin);
+    stream.channels(2);
+    stream.mix();
+
+    FftSeq fft_seq(stream, FFT_SIZE * 2, blackman);
+    fft_seq.optimal_spacing(44100, 12);
+
+    fft_seq.start();
+
+    std::cout << "FFT spacing: " << fft_seq.spacing() << std::endl;
+
     spectrum_shader.use();
 
-    //shader["color"] = {0.5, 1.0};
-    glUniform2f(spectrum_shader["color"], 0.5, 0.0);
+    glUniform1i(spectrum_shader["wfall"], 0);
 
-    auto spectrum_transform = translate(0.0f, 0.9f) * scale(1.0f, 0.1f);
+    auto spectrum_transform = translate(0.0f, 1.0f - SPECTRUM_HEIGHT) * scale(1.0f, SPECTRUM_HEIGHT);
 
     glUniformMatrix3fv(spectrum_shader["transform"], 1, GL_TRUE, spectrum_transform.data());
+    glUniform1f(spectrum_shader["width"], WIN_WIDTH);
 
     waterfall_shader.use();
-    auto waterfall_transform = translate(0.0f, -0.1) * scale(1.0f, 0.9f);
+    auto waterfall_transform = translate(0.0f, -SPECTRUM_HEIGHT) * scale(1.0f, 1.0f - SPECTRUM_HEIGHT);
 
     glUniformMatrix3fv(waterfall_shader["transform"], 1, GL_TRUE, waterfall_transform.data());
+    glUniform1i(waterfall_shader["wfall"], 0);
+    glUniform1i(waterfall_shader["cmap"], 1);
+    glUniform1f(waterfall_shader["wrapPos"], 0.0f);
+    glUniform1f(waterfall_shader["histLen"], 1024.0f);
+    glUniform1f(waterfall_shader["wfallHeight"], (1.0f - SPECTRUM_HEIGHT) * WIN_HEIGHT);
 
     bool running = true;
     while (running) {
@@ -142,6 +244,22 @@ int main()
                     running = false;
                     break;
             }
+        }
+
+        if (fft_seq.has_next()) {
+            auto fft_line = fft_seq.next();
+            fft_seq.notify();
+
+            gen_fft_mipmap(fft_line, line, false);
+
+            spectrum_shader.use();
+            glUniform1f(spectrum_shader["wrapPos"], line);
+
+            waterfall_shader.use();
+            glUniform1f(waterfall_shader["wrapPos"], line);
+
+            line++;
+            line &= 0x3ff;
         }
 
         glClearColor(1.0, 0.0, 0.0, 1.0);
@@ -160,9 +278,6 @@ int main()
 
     SDL_DestroyWindow(window);
     SDL_Quit();
-
-    //test_no_block_adapter();
-    test_fft_seq();
 
     return 0;
 }

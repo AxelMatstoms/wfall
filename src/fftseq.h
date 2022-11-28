@@ -8,114 +8,11 @@
 #include <numbers>
 #include <vector>
 #include <stdexcept>
+#include <functional>
 #include <thread>
-#include <mutex>
-#include <condition_variable>
-#include <optional>
+#include <atomic>
 
 #include "fft.h"
-
-/**
- * Adapts an ifstream to allow non-blocking reads.
- *
- * Starts a thread responsible for interacting with the ifstream. This
- * thread waits for a task, then does that task and waits again,
- * setting flags to indicate state.
- *
- * State diagram:
- * !ready -> waiting -> working -> done -> waiting
- *       (A)        (B)        (C)     (D)
- *
- * (A) worker is started and is now ready.
- * (B) worker receives a task and starts working.
- * (C) worker finishes task and marks done.
- * (D) controller receives result and marks !done.
- */
-class NoBlockAdapter {
-public:
-    enum class Task { none, read, skip, quit };
-
-private:
-    std::istream& input;
-
-    char *buffer = nullptr;
-    std::size_t buf_cap = 0;
-
-    Task _task = Task::none;
-    std::size_t _count = 0;
-
-    std::thread worker_thread;
-    mutable std::mutex task_avail_mutex;
-    std::condition_variable task_avail;
-    bool _ready = false;
-    bool _done = false;
-
-    /**
-     * Private worker thread.
-     */
-    void worker();
-
-public:
-    /**
-     * ctor.
-     *
-     * Starts worker thread.
-     */
-    NoBlockAdapter(std::istream& input);
-
-    /**
-     * dtor.
-     *
-     * Tells worker to finish and joins worker thread.
-     */
-    ~NoBlockAdapter();
-
-    /**
-     * Give worker the task of reading count bytes.
-     */
-    bool read(std::size_t count);
-
-    /**
-     * Give worker the task of ignoring count bytes.
-     */
-    bool skip(std::size_t count);
-
-    /**
-     * Mark task as finished.
-     */
-    void task_finished();
-
-    /**
-     * Returns true if task is done but not finished.
-     */
-    bool done() const;
-
-    /**
-     * Returns true if worker is waiting to receive a new task.
-     *
-     * To ensure worker is actually waiting it is necessary to aquire
-     * the task_avail_mutex since the worker unlocks it while waiting.
-     */
-    bool ready() const;
-
-    /**
-     * Return the workers current task.
-     */
-    Task task() const;
-
-    /**
-     * Return the result of a read tsk.
-     *
-     * Return a ptr pointing to a char buffer containing the bytes read
-     * by a read task.
-     */
-    char* result();
-};
-
-/**
- * Print a Task enum to an ostream.
- */
-std::ostream& operator<<(std::ostream& out, NoBlockAdapter::Task task);
 
 /**
  * Byteorder swap for 2-byte ints.
@@ -132,14 +29,6 @@ void bswap4(char* ptr);
  *
  * This is needed since PcmStream is templated on the sample format
  * and FftSeq does not depend on the sample format.
- *
- * Stream has a non-blocking interface where a the first time a
- * member function is called, a command is issued to complete that
- * task. The function can then be called many times to check and
- * possible receive the result of the task. Changing what task is
- * commanded, or the parameters to that task is undefined behaviour.
- * Once a command has been made, that same command must be repeated
- * until confirmation that it has been completed is received.
  */
 struct Stream {
     using OutSample = std::complex<float>;
@@ -150,8 +39,6 @@ struct Stream {
      * For multichannel data each frame (consisting of one sample for
      * each channel) must be processed in some way to yield a single
      * complex number.
-     *
-     * Returns an empty vector until task is done.
      */
     virtual std::vector<OutSample> read_chunk(std::size_t count) = 0;
 
@@ -160,20 +47,29 @@ struct Stream {
      *
      * This can be implemented so that it is cheaper to use this method
      * than to simply ignore output from Stream::read.
-     *
-     * Returns false until task is done.
      */
-    virtual bool skip(std::size_t count) = 0;
+    virtual void skip(std::size_t count) = 0;
 };
 
 /**
  * Parses PCM data.
+ *
+ * The sample format is specified with a template parameter.
+ * PcmStream has three ways of handling multichannel data:
+ * solo: the output stream is one of the channels from the input.
+ * mix: the output stream is the average of the input channels.
+ * iq: the real part of the output is the first channel and the
+ * imaginary part of the output is the second channel.
+ *
+ * The term frame is used to mean a sequence of n samples where n is
+ * the number of channels in the stream. The frame is aligned so that
+ * the first sample in the frame comes from the first channel.
  */
 template <typename Sample>
-class PcmStream : Stream {
+class PcmStream : public Stream {
     using Stream::OutSample;
 
-    NoBlockAdapter _input;
+    std::istream& _input;
     std::size_t _channels = 1;
     std::endian _endian = std::endian::little;
 
@@ -181,17 +77,51 @@ class PcmStream : Stream {
     bool _mix;
     bool _iq;
 
+    std::vector<char> buf;
+
 public:
+    /**
+     * ctor.
+     *
+     * Constructs a PcmStream from an istream.
+     */
     PcmStream(std::istream& input) : _input(input) {}
 
+    /**
+     * Getter for the number of channels.
+     */
     std::size_t channels() const { return _channels; }
+
+    /**
+     * Setter for the number of channels.
+     */
     void channels(std::size_t count) { _channels = count; }
 
+    /**
+     * Getter for the endianness.
+     */
     std::endian endian() const { return _endian; }
+
+    /**
+     * Setter for the endianness.
+     */
     void endian(std::endian order) { _endian = order; }
 
+    /**
+     * Returns true if the PcmStream is in solo mode.
+     */
     bool is_solo() const { return _mix || _iq; }
-    std::size_t get_solo() const { return _solo; }
+
+    /**
+     * Getter for the selected solo channel.
+     *
+     * Only valid if is_solo() returns true.
+     */
+    std::size_t solo() const { return _solo; }
+
+    /**
+     * Sets the PcmStream to solo mode and selects the given channel.
+     */
     void solo(std::size_t ch)
     {
         if (ch >= _channels)
@@ -202,13 +132,29 @@ public:
         _iq = false;
     }
 
+    /**
+     * Returns true if the PcmStream is in mix mode
+     */
     bool is_mix() const { return _mix; }
+
+    /**
+     * Sets the PcmStream to mix mode.
+     */
     void mix() {
         _mix = true;
         _iq = false;
     }
 
+    /**
+     * Returns true if the PcmStream is in iq mode
+     */
     bool is_iq() const { return _iq; }
+
+    /**
+     * Sets the PcmStream to iq mode.
+     *
+     * Throws an error if there is only one input channel.
+     */
     void iq()
     {
         if (_channels < 2) {
@@ -219,6 +165,9 @@ public:
     }
 
 private:
+    /**
+     * Swaps the bytes in buffer, depending on the sample width.
+     */
     void bswap_buffer(char *buffer, std::size_t size)
     {
         if (sizeof(Sample) == 2) {
@@ -232,15 +181,31 @@ private:
         }
     }
 
+    /**
+     * Converts a PCM sample to a normalized float (-1, 1)
+     *
+     * Signed sample formats are converted by dividing by the negative
+     * of the minimum value of that format. For example: signed 8-bit
+     * PCM is converted by dividing by 128.
+     *
+     * Unsigned sample formats are converted by dividing by half of the
+     * maximum value and subtracting 1.0f. Samples encoding amplitude
+     * zero are handled correctly.
+     */
     float pcm_convert(Sample sample)
     {
-        if constexpr (std::is_signed_v<Sample>) {
+        if constexpr (std::is_floating_point_v<Sample>) {
+            return sample;
+        } else if constexpr (std::is_signed_v<Sample>) {
             return (float) sample / -((float) std::numeric_limits<Sample>::min());
         } else {
             return (float) sample / (float) (std::numeric_limits<Sample>::max() / 2) - 1.0f;
         }
     }
 
+    /**
+     * Parses a pcm frame, returning the average of all channels.
+     */
     OutSample parse_mix(char *ptr)
     {
         OutSample out_sample = 0.0f;
@@ -252,6 +217,10 @@ private:
         return out_sample / float(_channels);
     }
 
+    /**
+     * Parses a pcm frame, returning the frame interpreted as an iq
+     * sample.
+     */
     OutSample parse_iq(char *ptr)
     {
         OutSample out_sample = 0.0f;
@@ -264,6 +233,9 @@ private:
         return out_sample;
     }
 
+    /**
+     * Parses one of samples in a frame and returns its amplitude.
+     */
     OutSample parse_solo(char *ptr)
     {
         Sample in_sample = *reinterpret_cast<Sample*>(ptr + _solo * sizeof(Sample));
@@ -271,29 +243,31 @@ private:
     }
 
 public:
+    /**
+     * Read a chunk of pcm data and convert it to floating point.
+     *
+     * Reads count frames from the stream, decoding each and
+     * returns a vector containing complex numbers that are
+     * the input for an fft.
+     */
     std::vector<OutSample> read_chunk(std::size_t count) override
     {
         std::size_t total_size = count * _channels * sizeof(Sample);
 
-        char *buffer;
-        if (!_input.done()) {
-            if (_input.ready()) {
-                _input.read(total_size);
-            }
-
-            return std::vector<OutSample>();
+        if (total_size != buf.size()) {
+            buf.resize(total_size);
         }
 
-        buffer = _input.result();
+        _input.read(buf.data(), total_size);
 
         if (_endian != std::endian::native) {
-            bswap_buffer(buffer, total_size);
+            bswap_buffer(buf.data(), total_size);
         }
 
         std::vector<OutSample> out;
         out.reserve(count);
         for (std::size_t i = 0; i < count; i++) {
-            char *ptr = buffer + i * _channels * sizeof(Sample);
+            char *ptr = buf.data() + i * _channels * sizeof(Sample);
 
             if (_mix) {
                 out.push_back(parse_mix(ptr));
@@ -307,33 +281,72 @@ public:
         return out;
     }
 
-    bool skip(std::size_t count) override
+    /**
+     * Skip count frames of input data.
+     */
+    void skip(std::size_t count) override
     {
         std::size_t total_size = count * _channels * sizeof(Sample);
-
-        if (!_input.done()) {
-            if (_input.ready()) {
-                _input.skip(total_size);
-            }
-
-            return false;
-        }
-
-        return true;
+        _input.ignore(total_size);
     }
 };
 
-class FftSeq {
-    Stream& stream;
+std::vector<float> blackman(std::size_t N);
+std::vector<float> rectangular(std::size_t N);
 
+/**
+ * Asynchronously computes consecutive FFTs of a signal.
+ *
+ * Uses a thread for FFT computation and I/O. Applies the chosen window
+ * function to the input data before running the FFT.
+ * The basic usage is as following:
+ *
+ * FftSeq fft_seq(...);
+ * fft_seq.start();
+ * while (...) {
+ *   if (fft_seq.has_next()) {
+ *     // Move the fft to v.
+ *     auto v = fft_seq.next();
+ *     // Notify thread to start working again.
+ *     fft_seq.notify();
+ *   }
+ * }
+ *
+ * After finishing its computation the thread waits until notify is
+ * called.
+ */
+class FftSeq {
+public:
+    using WinFn = std::function<std::vector<float>(std::size_t)>;
+
+private:
+    Stream& _stream;
     std::size_t _fft_size;
-    int _gap;
+    int _spacing = 0;
+    WinFn _window_fn;
+    std::vector<std::complex<float>> _result;
+    std::thread _worker;
+    std::atomic<bool> _done;
+    bool _quit = false;
+
+    void worker_fn();
 
 public:
-    FftSeq(Stream& stream);
+    FftSeq(Stream& stream, std::size_t fft_size, const WinFn& win_fn = blackman);
+    ~FftSeq();
 
-    void consecutive();
-    void fftrate(float sample_rate, float rate);
+    void start();
+
+    std::size_t fft_size() const;
+
+    void spacing(int spacing);
+    int spacing() const;
+
+    void optimal_spacing(float srate, float fft_rate);
+
+    bool has_next() const;
+    std::vector<std::complex<float>>&& next();
+    void notify();
 };
 
 #endif /* WFALL_FFTSEQ_H */

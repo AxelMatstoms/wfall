@@ -3,43 +3,30 @@
 
 #include <vector>
 #include <complex>
+#include <algorithm>
 
 template <bool IsConst>
-struct fft_slice_reference {};
+struct fft_view_container {};
 
-template <> struct fft_slice_reference<false> {
-    using type = std::complex<float>&;
-};
-
-template <> struct fft_slice_reference<true> {
-    using type = std::complex<float>&;
-};
-
-template <bool IsConst>
-using fft_slice_reference_t = fft_slice_reference<IsConst>::type;
-
-template <bool IsConst>
-struct fft_slice_container {};
-
-template <> struct fft_slice_container<false> {
+template <> struct fft_view_container<false> {
     using type = std::vector<std::complex<float>>&;
 };
 
-template <> struct fft_slice_container<true> {
+template <> struct fft_view_container<true> {
     using type = const std::vector<std::complex<float>>&;
 };
 
 template <bool IsConst>
-using fft_slice_container_t = fft_slice_container<IsConst>::type;
+using fft_view_container_t = fft_view_container<IsConst>::type;
 
 template <bool IsConst>
-class FftSliceTemp {
+class FftViewTemplate {
 public:
-    using reference = fft_slice_reference_t<IsConst>;
+    using reference = std::complex<float>&;
 
     using const_reference = const std::complex<float>&;
 
-    using container = fft_slice_container_t<IsConst>;
+    using container = fft_view_container_t<IsConst>;
 
 private:
     container _vec;
@@ -48,8 +35,8 @@ private:
     std::size_t _stride = 1;
 
 public:
-    FftSliceTemp(container vec) : _vec(vec), _size(vec.size()) {}
-    FftSliceTemp(container vec, std::size_t start, std::size_t size, std::size_t stride)
+    FftViewTemplate(container vec) : _vec(vec), _size(vec.size()) {}
+    FftViewTemplate(container vec, std::size_t start, std::size_t size, std::size_t stride)
         : _vec(vec), _start(start), _size(size), _stride(stride) {}
 
     std::size_t size() const { return _size; }
@@ -64,20 +51,20 @@ public:
         return _vec[_start + _stride * pos];
     }
 
-    FftSliceTemp operator()(std::size_t start, std::size_t size, std::size_t stride = 1) const requires IsConst
+    FftViewTemplate operator()(std::size_t start, std::size_t size, std::size_t stride = 1) const requires IsConst
     {
-        return FftSliceTemp(_vec, _start + start * _stride, _stride * stride, size);
+        return FftViewTemplate(_vec, _start + start * _stride, size, _stride * stride);
     }
 
-    FftSliceTemp operator()(std::size_t start, std::size_t size, std::size_t stride = 1) requires (!IsConst)
+    FftViewTemplate operator()(std::size_t start, std::size_t size, std::size_t stride = 1) requires (!IsConst)
     {
-        return FftSliceTemp(_vec, _start + start * _stride, _stride * stride, size);
+        return FftViewTemplate(_vec, _start + start * _stride, size, _stride * stride);
     }
 };
 
-using CFftSlice = FftSliceTemp<true>;
-using FftSlice = FftSliceTemp<false>;
+using CFftView = FftViewTemplate<true>;
+using FftView = FftViewTemplate<false>;
 
-void ditfft2(const CFftSlice& in, FftSlice& out);
+void ditfft2(CFftView in, FftView out);
 
 #endif /* WFALL_FFT_H */

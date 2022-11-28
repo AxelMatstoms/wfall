@@ -1,138 +1,5 @@
 #include "fftseq.h"
-
-NoBlockAdapter::NoBlockAdapter(std::istream& input) : input(input)
-{
-    worker_thread = std::thread(&NoBlockAdapter::worker, this);
-}
-
-NoBlockAdapter::~NoBlockAdapter()
-{
-    if (buffer != nullptr)
-        delete[] buffer;
-
-    // quit and join
-    task_avail_mutex.lock();
-    task_avail_mutex.unlock();
-    _task = Task::quit;
-    task_avail.notify_one();
-    worker_thread.join();
-}
-
-bool NoBlockAdapter::read(std::size_t count)
-{
-    if (!ready()) {
-        return false;
-    }
-
-    _task = Task::read;
-    _count = count;
-    _done = false;
-
-    task_avail_mutex.unlock();
-    task_avail.notify_one();
-
-    return true;
-}
-
-bool NoBlockAdapter::skip(std::size_t count)
-{
-    if (!ready()) {
-        return false;
-    }
-
-    _task = Task::skip;
-    _count = count;
-    _done = false;
-
-    task_avail_mutex.unlock();
-    task_avail.notify_one();
-
-    return true;
-}
-
-void NoBlockAdapter::task_finished()
-{
-    _done = false;
-}
-
-bool NoBlockAdapter::done() const
-{
-    return _done;
-}
-
-bool NoBlockAdapter::ready()
-{
-    if (_ready && task_avail_mutex.try_lock()) {
-        task_avail_mutex.unlock();
-        return true;
-    }
-
-    return false;
-}
-
-NoBlockAdapter::Task NoBlockAdapter::task() const
-{
-    return _task;
-}
-
-char* NoBlockAdapter::result()
-{
-    return buffer;
-}
-
-void NoBlockAdapter::worker()
-{
-    std::unique_lock<std::mutex> lk(task_avail_mutex);
-    while (true) {
-        _ready = true;
-        task_avail.wait(lk, [this]{ return _task != Task::none; });
-        _ready = false;
-
-        std::cout << "Got work _task=" << _task << " _count=" << _count << std::endl;
-
-        if (_task == Task::quit) {
-            break;
-        } else if (_task == Task::read) {
-            if (buf_cap < _count) {
-                if (buffer != nullptr)
-                    delete[] buffer;
-                buffer = new char[_count];
-                buf_cap = _count;
-                std::cout << "Allocting new buffer of size " << _count << std::endl;
-            }
-
-            input.read(buffer, _count);
-            _done = true;
-        } else if (_task == Task::skip) {
-            input.ignore(_count);
-            _done = true;
-        }
-
-        _task = Task::none;
-    }
-}
-
-std::ostream& operator<<(std::ostream& out, NoBlockAdapter::Task task)
-{
-    using Task = NoBlockAdapter::Task;
-
-    switch (task) {
-        case Task::none:
-            out << "Task::none";
-            break;
-        case Task::read:
-            out << "Task::read";
-            break;
-        case Task::skip:
-            out << "Task::skip";
-            break;
-        case Task::quit:
-            out << "Task::quit";
-            break;
-    }
-
-    return out;
-}
+#include <numbers>
 
 void bswap2(char* ptr)
 {
@@ -149,4 +16,132 @@ void bswap4(char* ptr)
     ptr[1] = ptr[2];
     ptr[2] = tmp1;
     ptr[3] = tmp0;
+}
+
+std::vector<float> blackman(std::size_t N)
+{
+    using namespace std::numbers;
+
+    static const float a0 = 0.42f;
+    static const float a1 = 0.50f;
+    static const float a2 = 0.50f;
+
+    std::vector<float> win(N);
+
+    for (std::size_t n = 1; n < N + 1; ++n) {
+        win[n - 1] = a0 - a1 * std::cos((2.0f * pi_v<float> * n) / N)
+            + a2 * std::cos((4.0f * pi_v<float> * n) / N);
+    }
+
+    return win;
+}
+
+std::vector<float> rectangular(std::size_t N)
+{
+    return std::vector<float>(N, 1.0f);
+}
+
+FftSeq::FftSeq(Stream& stream, std::size_t fft_size, const WinFn& win_fn)
+    : _stream(stream), _fft_size(fft_size), _window_fn(win_fn), _done(false) {}
+
+FftSeq::~FftSeq()
+{
+    _quit = true;
+    _done = false;
+    _done.notify_one();
+    if (_worker.joinable()) {
+        _worker.join();
+    }
+}
+
+void FftSeq::start()
+{
+    _worker = std::thread(&FftSeq::worker_fn, this);
+}
+
+std::size_t FftSeq::fft_size() const
+{
+    return _fft_size;
+}
+
+/*
+void FftSeq::fft_size(std::size_t size)
+{
+    _fft_size = size;
+}
+*/
+
+void FftSeq::spacing(int spacing)
+{
+    _spacing = spacing;
+}
+
+int FftSeq::spacing() const
+{
+    return _spacing;
+}
+
+void FftSeq::optimal_spacing(float srate, float fft_rate)
+{
+    float samples_per_fft = srate / fft_rate;
+    _spacing = (int) (0.5 + samples_per_fft - _fft_size);
+}
+
+bool FftSeq::has_next() const
+{
+    return _done.load();
+}
+
+std::vector<std::complex<float>>&& FftSeq::next()
+{
+    return std::move(_result);
+}
+
+void FftSeq::notify()
+{
+    _done = false;
+    _done.notify_one();
+}
+
+void FftSeq::worker_fn()
+{
+    std::size_t size = 0;
+    std::vector<float> window;
+    std::vector<std::complex<float>> buffer;
+    while (1) {
+        if (size != _fft_size) {
+            size = _fft_size;
+            window = _window_fn(size);
+
+            if (_spacing < 0) {
+                buffer = std::vector<std::complex<float>>(size);
+            }
+        }
+
+        std::vector<std::complex<float>> in_vec;
+
+        if (_spacing >= 0) {
+            _stream.skip(_spacing);
+            in_vec = _stream.read_chunk(size);
+        } else if (_spacing < 0) {
+            std::move(buffer.end() + _spacing, buffer.end(), buffer.begin());
+            auto tmp = _stream.read_chunk(size + _spacing);
+            std::copy_n(tmp.begin(), tmp.size(), buffer.begin());
+            in_vec = buffer;
+        }
+
+        for (std::size_t i = 0; i < size; i++) {
+            in_vec[i] *= window[i];
+        }
+
+        _result.resize(size);
+        ditfft2(in_vec, _result);
+
+        if (_quit) {
+            break;
+        }
+
+        _done = true;
+        _done.wait(true);
+    }
 }
